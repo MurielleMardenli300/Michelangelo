@@ -1,0 +1,10 @@
+*.ckpt
+*.yaml
+
+*.log
+*.json
+*.obj
+
+events.*
+*.safetensors
+wandb/*
