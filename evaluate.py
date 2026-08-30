@@ -1,8 +1,11 @@
 from train import ShapeVAEModule
 import torch, open3d as o3d, numpy as np, trimesh
+import datetime
 
 model = ShapeVAEModule.load_from_checkpoint(
-    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/epoch=047-val/loss=0.3144.ckpt'
+    # '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/epoch=048-val/loss=0.0897.ckpt'
+    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/last-v33.ckpt'
+    # '/home/mardenlim/codebases/Michelangelo/checkpoints/aligned_shape_latents/shapevae-256.ckpt'
 )
 model.eval().cuda()
 
@@ -17,12 +20,12 @@ nrm = np.asarray(pcd.normals, np.float32)
 # receiving raw-scale, uncentered point coordinates -- completely outside
 # the [-0.9995, 0.9995] distribution it was trained on. That mismatch is the
 # most likely reason reconstruct() was returning None.
-centroid = pts.mean(0)
-pts = pts - centroid
-scale = np.abs(pts).max()
-pts = pts / (scale + 1e-8)
-pts = np.clip(pts * 0.9995, -0.9995, 0.9995)
-nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8)
+# centroid = pts.mean(0)
+# pts = pts - centroid
+# scale = np.abs(pts).max()
+# pts = pts / (scale + 1e-8)
+# pts = np.clip(pts * 0.9995, -0.9995, 0.9995)
+# nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8)
 # ─────────────────────────────────────────────────────────────────────────
 
 print(f"[debug] pts range after normalization: [{pts.min():.4f}, {pts.max():.4f}] "
@@ -30,7 +33,13 @@ print(f"[debug] pts range after normalization: [{pts.min():.4f}, {pts.max():.4f}
 
 surface = torch.from_numpy(np.concatenate([pts, nrm], -1)).float().unsqueeze(0).cuda()
 
+cur_time = datetime.datetime.now().strftime("%d_%H-%M-%S")
+
 outputs = model.reconstruct(surface, octree_depth=7)
+
+end_time = datetime.datetime.now().strftime("%d_%H-%M-%S")
+
+print(f"CURRENT TIME: {cur_time}, END TIME: {end_time}")
 if outputs[0] is not None:
     print("Outputs not none!")
     mesh = trimesh.Trimesh(outputs[0].mesh_v, outputs[0].mesh_f)
