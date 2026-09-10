@@ -4,6 +4,13 @@
 *.log
 *.json
 *.obj
+*.stl
+*.ply
+output/
+*.db
+
+# store
+*.pyc
 
 events.*
 *.safetensors

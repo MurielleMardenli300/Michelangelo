@@ -4,7 +4,7 @@ import datetime
 
 model = ShapeVAEModule.load_from_checkpoint(
     # '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/epoch=048-val/loss=0.0897.ckpt'
-    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/last-v33.ckpt'
+    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/last-v47.ckpt'
     # '/home/mardenlim/codebases/Michelangelo/checkpoints/aligned_shape_latents/shapevae-256.ckpt'
 )
 model.eval().cuda()
@@ -20,12 +20,12 @@ nrm = np.asarray(pcd.normals, np.float32)
 # receiving raw-scale, uncentered point coordinates -- completely outside
 # the [-0.9995, 0.9995] distribution it was trained on. That mismatch is the
 # most likely reason reconstruct() was returning None.
-# centroid = pts.mean(0)
-# pts = pts - centroid
-# scale = np.abs(pts).max()
-# pts = pts / (scale + 1e-8)
-# pts = np.clip(pts * 0.9995, -0.9995, 0.9995)
-# nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8)
+centroid = pts.mean(0)
+pts = pts - centroid
+scale = np.abs(pts).max()
+pts = pts / (scale + 1e-8)
+pts = np.clip(pts * 0.9995, -0.9995, 0.9995)
+nrm = nrm / (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8)
 # ─────────────────────────────────────────────────────────────────────────
 
 print(f"[debug] pts range after normalization: [{pts.min():.4f}, {pts.max():.4f}] "

@@ -87,8 +87,26 @@ def build_dataloaders(args, n_volume: int, n_near: int):
         n_surface=args.n_surface,
         n_volume=n_volume,
         n_near=n_near,
-        augment=True,
+        augment=(not args.overfit_single_sample),  # no augmentation when overfitting one sample
     )
+
+    if args.overfit_single_sample:
+        # Bypass train/val split entirely -- use the SAME one sample for
+        # both train and val, so hyperparameter search is scored on how
+        # well the model overfits that one sample, not on unrelated
+        # generalization to a held-out split that doesn't exist yet.
+        from torch.utils.data import Subset
+        single_ds = Subset(full_dataset, [args.overfit_sample_idx])
+
+        train_loader = DataLoader(
+            single_ds, batch_size=1, shuffle=False,
+            num_workers=0, pin_memory=True, drop_last=False,
+        )
+        val_loader = DataLoader(
+            single_ds, batch_size=1, shuffle=False,
+            num_workers=0, pin_memory=True, drop_last=False,
+        )
+        return train_loader, val_loader
 
     n_val = max(1, int(len(full_dataset) * args.val_split))
     n_train = len(full_dataset) - n_val
@@ -125,6 +143,12 @@ def objective(trial: optuna.Trial, args, detected_config: dict):
     n_volume = trial.suggest_categorical("n_volume", [1024, 1536, 2048, 3072])
     n_near = trial.suggest_categorical("n_near", [1024, 1536, 2048, 3072])
 
+    # batch_size must not exceed what the training split can actually fill,
+    # or drop_last=True silently produces zero batches every trial (this is
+    # what was happening with only ~2 total samples and batch_size 4/8).
+    batch_size_options = [b for b in [2, 4, 8] if b <= args.max_batch_size]
+    if not batch_size_options:
+        batch_size_options = [args.max_batch_size]
     batch_size_override = 1
     args.batch_size = 1
 
@@ -180,8 +204,12 @@ def objective(trial: optuna.Trial, args, detected_config: dict):
     except Exception as e:
         # a bad hyperparameter combo (e.g. NaN loss, OOM) shouldn't kill the
         # whole search -- report a very high loss so optuna treats it as bad
-        # and moves on, rather than crashing the study.
-        print(f"[trial {trial.number}] failed with: {e}")
+        # and moves on, rather than crashing the study. Print the FULL
+        # traceback (not just str(e)) so real bugs are debuggable instead of
+        # silently swallowed as "just another bad trial".
+        import traceback
+        print(f"[trial {trial.number}] failed with:")
+        traceback.print_exc()
         return float("inf")
 
     # PyTorchLightningPruningCallback sets an internal flag rather than
@@ -208,11 +236,22 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_batch_size", type=int, default=None,
+                         help="Cap the batch_size search space. If not set, this is "
+                              "computed automatically from the dataset size so that "
+                              "drop_last=True can never produce zero training batches.")
 
     parser.add_argument("--n_trials", type=int, default=30)
     parser.add_argument("--epochs_per_trial", type=int, default=15,
                          help="Kept short deliberately -- this is a search, not a full run. "
                               "Re-train the best config for many more epochs afterward.")
+    parser.add_argument("--overfit_single_sample", action="store_true",
+                         help="Bypass train/val split entirely and use the SAME one sample "
+                              "for both train and val. Use this when your dataset is too "
+                              "small for a real split and you're deliberately searching "
+                              "hyperparameters to overfit one sample.")
+    parser.add_argument("--overfit_sample_idx", type=int, default=0,
+                         help="Which dataset index to use when --overfit_single_sample is set.")
     parser.add_argument("--output_dir", default="./hp_search_output")
     parser.add_argument("--study_name", default="shapevae_search")
     parser.add_argument("--storage", default=None,
@@ -226,6 +265,34 @@ def main():
     # must match the pretrained checkpoint regardless of training hparams
     detected_config = detect_model_config_from_ckpt(args.pretrained_ckpt)
     print(f"Fixed architecture (from checkpoint, not searched): {detected_config}")
+
+    # ── Auto-cap batch_size to what the dataset can actually support ──────────
+    if args.overfit_single_sample:
+        args.max_batch_size = 1
+        print(f"[overfit mode] Using sample idx={args.overfit_sample_idx} for both "
+              f"train and val, batch_size forced to 1.")
+    else:
+        # Peek at dataset size without fully re-instantiating AbdominalDataset's
+        # sample scan twice -- reuse the same count that build_dataloaders will see.
+        n_total = len(AbdominalDataset(pc_dir=args.pc_dir, mesh_dir=args.mesh_dir,
+                                         n_surface=args.n_surface, n_volume=1, n_near=1,
+                                         augment=False))
+        n_val = max(1, int(n_total * args.val_split))
+        n_train = n_total - n_val
+
+        if n_train < 1:
+            raise ValueError(
+                f"Dataset has only {n_total} total samples; after a {args.val_split:.0%} "
+                f"val split this leaves {n_train} training samples, which is not enough "
+                f"to train at all. Reduce --val_split, add more data, or pass "
+                f"--overfit_single_sample to bypass the split and overfit one sample."
+            )
+
+        if args.max_batch_size is None:
+            args.max_batch_size = max(1, n_train)
+            print(f"[auto] Dataset has {n_total} total samples ({n_train} train / {n_val} val). "
+                  f"Capping batch_size search to <= {args.max_batch_size} so drop_last=True "
+                  f"can't silently produce zero training batches.")
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
