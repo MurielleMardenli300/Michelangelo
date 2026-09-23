@@ -1,11 +1,7 @@
-
-
 import os
 import sys
 import argparse
-import glob
 import math
-import time
 from functools import partial
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,21 +9,21 @@ from typing import List, Optional, Tuple
 import numpy as np
 import open3d as o3d
 import torch
-import torch.nn.functional as F
 import trimesh
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 # ── Michelangelo imports (assumes repo root on PYTHONPATH) ─────────────────────
 sys.path.insert(0, str(Path(__file__).parent))  # adjust if needed
 from michelangelo.models.tsal.sal_perceiver import ShapeAsLatentPerceiver
 from michelangelo.models.tsal.inference_utils import extract_geometry
 from michelangelo.models.tsal.tsal_base import Latent2MeshOutput
-from michelangelo.models.modules.distributions import DiagonalGaussianDistribution
 
 import datetime
+import split_utils
+
 
 class AbdominalDataset(Dataset):
     """
@@ -40,88 +36,23 @@ class AbdominalDataset(Dataset):
     """
 
     def __init__(self,
-                 pc_dir: str,
-                 mesh_dir: str,
+                 sample_pairs: List[Tuple[str, str]],
                  n_surface: int = 1600,
                  n_volume: int = 2048,
                  n_near: int = 1536,
                  augment: bool = True):
 
         self.n_surface = n_surface
-        self.n_volume  = n_volume
-        self.n_near    = n_near
-        self.augment   = augment
+        self.n_volume = n_volume
+        self.n_near = n_near
+        self.augment = augment
+        self.samples: List[Tuple[str, str]] = sample_pairs
 
-        self.samples: List[Tuple[str, str]] = []   # (ply_path, stl_path)
-
-        for participant_dir in sorted(Path(pc_dir).iterdir()):
-            if not participant_dir.is_dir():
-                continue
-            participant = participant_dir.name
-            mesh_part_dir = Path(mesh_dir) / participant
-            if not mesh_part_dir.is_dir():
-                continue
-
-            for ply_path in sorted(participant_dir.glob("*.ply")):
-                stem = ply_path.stem
-                try:
-                    frame_num = int("".join(filter(str.isdigit, stem)))
-                except ValueError:
-                    continue
-                stl_path = mesh_part_dir / f"mesh_{frame_num}.stl"
-                if stl_path.exists():
-                    self.samples.append((str(ply_path), str(stl_path)))
-
-        print(f"Dataset: {len(self.samples)} paired samples found.")
+        print(f"Dataset: {len(self.samples)} paired samples "
+              f"(augment={self.augment}).")
 
     def __len__(self):
         return len(self.samples)
-
-    def _load_pointcloud(self, ply_path: str) -> np.ndarray:
-        """Load PLY, FPS to n_surface, return [n_surface, 6] in [-0.9995, 0.9995]."""
-        pcd = o3d.io.read_point_cloud(ply_path)
-        pts = np.asarray(pcd.points, dtype=np.float32)
-
-        # if not pcd.has_normals():
-        #     pcd.estimate_normals(
-        #         o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30)
-        #     )
-        #     pcd.orient_normals_consistent_tangent_plane(100)
-
-        nrm = np.asarray(pcd.normals, dtype=np.float32)
-
-        # normalise to [-0.9995, 0.9995]
-        # centroid = pts.mean(0)
-        # pts -= centroid
-        # scale = np.abs(pts).max()
-        # pts /= (scale + 1e-8)
-        # pts = np.clip(pts * 0.9995, -0.9995, 0.9995)
-        # nrm /= (np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-8)
-
-        # FPS or random subsample to fixed n_surface
-        N = len(pts)
-        print(f"N SIZE OF PTS: {N}")
-        if N >= self.n_surface:
-            print("-- pts length exceeds max")
-            idx = np.random.choice(N, self.n_surface, replace=False)
-        else:
-            print("-- pts at other length")
-            idx = np.concatenate([np.arange(N),
-                                   np.random.choice(N, self.n_surface - N, replace=True)])
-            
-        # save ply check downsample
-        # ply_path = Path(f"./output/load_pc_test/pointcloud_test.ply")
-        # ply_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # pcd = np.concatenate([pts[idx], nrm[idx]], axis=-1) 
-
-        # o3d.io.write_point_cloud(str(ply_path), pcd)
-        # log(f"  Normal PLY saved to {ply_path}")
-        # print(f"  Normal PLY saved to {ply_path}")    
-        
-        print("NO NORMALIZATION FOR PCD")
-        return np.concatenate([pts[idx], nrm[idx]], axis=-1)   # [n_surface, 6]
-
 
     def _sample_geo_points(self, mesh: trimesh.Trimesh) -> np.ndarray:
         bounds = mesh.bounds
@@ -140,7 +71,7 @@ class AbdominalDataset(Dataset):
 
         surf_seed, _ = trimesh.sample.sample_surface(mesh, n_biased)
         surf_seed = surf_seed.astype(np.float32)
-        biased_sigma = extent.mean() * 0.1   # wider jitter than near_pts, still shell-centered
+        biased_sigma = extent.mean() * 0.1
         biased_pts = surf_seed + np.random.randn(n_biased, 3).astype(np.float32) * biased_sigma
 
         vol_pts = np.concatenate([uniform_pts, biased_pts], axis=0)
@@ -157,7 +88,6 @@ class AbdominalDataset(Dataset):
         all_pts_n = np.clip(all_pts_n, -1.25, 1.25)
 
         return np.concatenate([all_pts_n, occ[:, None]], axis=-1)
-
 
     def __getitem__(self, idx: int):
         ply_path, stl_path = self.samples[idx]
@@ -236,7 +166,7 @@ class ShapeVAEModule(pl.LightningModule):
 
         super().__init__()
         self.save_hyperparameters()
-        
+
         print(f"ShapeVAEModule: num_latents={num_latents}, point_feats={point_feats}, ")
 
         self.model = ShapeAsLatentPerceiver(
@@ -259,15 +189,14 @@ class ShapeVAEModule(pl.LightningModule):
         )
 
         self.near_weight = near_weight
-        self.kl_weight   = kl_weight
+        self.kl_weight = kl_weight
         self.geo_criterion = torch.nn.BCEWithLogitsLoss()
-        
+
         self._fixed_val_sample = None
 
         if pretrained_ckpt is not None:
             self._load_pretrained(pretrained_ckpt)
-          
-            
+
     def on_validation_epoch_end(self):
         """Every N epochs, reconstruct a fixed validation sample and save as .stl,
         so you can visually track reconstruction quality over training."""
@@ -280,13 +209,13 @@ class ShapeVAEModule(pl.LightningModule):
             print("[mesh export] no fixed validation sample set, skipping export.")
             return
         if not self.trainer.is_global_zero:
-            return  
+            return
 
         surface = self._fixed_val_sample["surface"].unsqueeze(0).to(self.device)
 
         print(f"[mesh export] epoch {self.current_epoch}: "
-            f"surface xyz range = "
-            f"[{surface[..., :3].min().item():.4f}, {surface[..., :3].max().item():.4f}]")
+              f"surface xyz range = "
+              f"[{surface[..., :3].min().item():.4f}, {surface[..., :3].max().item():.4f}]")
 
         self.eval()
         with torch.no_grad():
@@ -304,24 +233,14 @@ class ShapeVAEModule(pl.LightningModule):
         out_path = out_dir / f"epoch_{self.current_epoch:04d}.stl"
         mesh.export(str(out_path))
         print(f"[mesh export] epoch {self.current_epoch}: saved "
-            f"{len(mesh.vertices)} verts / {len(mesh.faces)} faces -> {out_path}")
+              f"{len(mesh.vertices)} verts / {len(mesh.faces)} faces -> {out_path}")
 
-
-    # weight loading 
+    # weight loading
 
     def _load_pretrained(self, ckpt_path: str):
-        """
-        Load only the shape-model weights from the full Michelangelo checkpoint.
-        The full checkpoint has keys like:
-            model.shape_model.encoder.query
-            model.shape_model.pre_kl.weight
-            ...
-        We strip the 'model.shape_model.' prefix and load into self.model.
-        """
         print(f"Loading pretrained weights from {ckpt_path}")
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # handle both raw state_dict and Lightning checkpoint formats
         if "state_dict" in sd:
             sd = sd["state_dict"]
 
@@ -332,7 +251,6 @@ class ShapeVAEModule(pl.LightningModule):
                 shape_sd[k[len(prefix):]] = v
 
         if len(shape_sd) == 0:
-            # try without the alignment wrapper prefix
             prefix = "shape_model."
             for k, v in sd.items():
                 if k.startswith(prefix):
@@ -346,37 +264,24 @@ class ShapeVAEModule(pl.LightningModule):
         print(f"Pretrained load: {len(shape_sd)} keys found, "
               f"{len(missing)} missing, {len(unexpected)} unexpected.")
         if missing:
-            print(f"  Missing: {missing[:5]}{'...' if len(missing) > 5 else ''}")
-            
-        print(
-            f"Pretrained load: "
-            f"{len(shape_sd)} checkpoint keys, "
-            f"{len(missing)} missing, "
-            f"{len(unexpected)} unexpected."
-        )
-
-        if missing:
             print("\nMISSING KEYS:")
             for k in missing:
                 print("  ", k)
-
         if unexpected:
             print("\nUNEXPECTED KEYS:")
             for k in unexpected:
                 print("  ", k)
 
-
     def _step(self, batch, split: str):
-        surface    = batch["surface"]                 # [B, N, 6]
-        geo_points = batch["geo_points"]              # [B, P, 4]
+        surface = batch["surface"]                 # [B, N, 6]
+        geo_points = batch["geo_points"]            # [B, P, 4]
 
-        pc    = surface[..., :3]                      # xyz
-        feats = surface[..., 3:6]                     # normals
+        pc = surface[..., :3]                       # xyz
+        feats = surface[..., 3:6]                    # normals
 
-        volume_queries = geo_points[..., :3]          # [B, P, 3]
-        occ_labels     = geo_points[..., 3]           # [B, P]
+        volume_queries = geo_points[..., :3]         # [B, P, 3]
+        occ_labels = geo_points[..., 3]               # [B, P]
 
-        # forward through shape VAE
         logits, _, posterior = self.model(
             pc=pc,
             feats=feats,
@@ -384,20 +289,15 @@ class ShapeVAEModule(pl.LightningModule):
             sample_posterior=(split == "train"),
         )                                             # logits: [B, P]
 
-        n_vol  = self.hparams.get("n_volume", logits.shape[1] // 2) if hasattr(self, "hparams") else logits.shape[1] // 2
-        # split logits into volume and near-surface regions
-        # (they were concatenated in that order in the dataset)
-        vol_logits  = logits[:, :n_vol]
+        n_vol = self.hparams.get("n_volume", logits.shape[1] // 2) if hasattr(self, "hparams") else logits.shape[1] // 2
+        vol_logits = logits[:, :n_vol]
         near_logits = logits[:, n_vol:]
-        vol_labels  = occ_labels[:, :n_vol]
+        vol_labels = occ_labels[:, :n_vol]
         near_labels = occ_labels[:, n_vol:]
 
-        # vol_bce = binary cross-entropy of far field volume (predicts if interior and exterior are predicted correctly)
-        # near_bce = binary cross-entropy of near-surface region (reconstruction detail quality)
-        vol_bce  = self.geo_criterion(vol_logits.float(),  vol_labels.float())
+        vol_bce = self.geo_criterion(vol_logits.float(), vol_labels.float())
         near_bce = self.geo_criterion(near_logits.float(), near_labels.float())
 
-        # kl_loss = Regularizes latent space to be smooth
         if posterior is None:
             kl_loss = torch.tensor(0.0, device=logits.device)
         else:
@@ -407,15 +307,14 @@ class ShapeVAEModule(pl.LightningModule):
 
         with torch.no_grad():
             acc = ((logits >= 0) == occ_labels.bool()).float().mean()
-            # fraction of query points labeled "inside" (occupancy = 1)
             pos_ratio = occ_labels.mean()
 
         self.log_dict({
-            f"{split}/loss":      loss,
-            f"{split}/vol_bce":   vol_bce,
-            f"{split}/near_bce":  near_bce,
-            f"{split}/kl":        kl_loss,
-            f"{split}/accuracy":  acc,
+            f"{split}/loss": loss,
+            f"{split}/vol_bce": vol_bce,
+            f"{split}/near_bce": near_bce,
+            f"{split}/kl": kl_loss,
+            f"{split}/accuracy": acc,
             f"{split}/pos_ratio": pos_ratio,
         }, prog_bar=True, sync_dist=True, batch_size=surface.shape[0])
 
@@ -426,7 +325,6 @@ class ShapeVAEModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         return self._step(batch, "val")
-
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -440,7 +338,6 @@ class ShapeVAEModule(pl.LightningModule):
             ws = self.hparams.warmup_steps
             if step < ws:
                 return step / max(1, ws)
-            # cosine decay to 10% of peak LR
             progress = (step - ws) / max(1, self.trainer.max_steps - ws)
             return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
@@ -455,19 +352,11 @@ class ShapeVAEModule(pl.LightningModule):
 
     @torch.no_grad()
     def reconstruct(self,
-                    surface: torch.FloatTensor,
-                    bounds: float = 1.1,
-                    octree_depth: int = 7,
-                    num_chunks: int = 10000) -> List[Latent2MeshOutput]:
-        """
-        Full encode → decode → marching cubes for a batch of point clouds.
-
-        Args:
-            surface: [B, N, 6]  xyz + normals in [-0.9995, 0.9995]
-        Returns:
-            List of Latent2MeshOutput (one per sample in batch)
-        """
-        pc    = surface[..., :3]
+                     surface: torch.FloatTensor,
+                     bounds: float = 1.1,
+                     octree_depth: int = 7,
+                     num_chunks: int = 10000) -> List[Latent2MeshOutput]:
+        pc = surface[..., :3]
         feats = surface[..., 3:6]
 
         latents, _, _ = self.model.encode(pc, feats, sample_posterior=False)
@@ -506,7 +395,19 @@ def parse_args():
     p.add_argument("--n_surface", type=int, default=1600)
     p.add_argument("--n_volume", type=int, default=2048)
     p.add_argument("--n_near", type=int, default=1536)
-    p.add_argument("--val_split", type=float, default=0.15)
+
+    # ── split management ────────────────────────────────────────────────
+    p.add_argument("--split_json", default="./output/split.json",
+                    help="Path to the train/val/test split file. If it "
+                         "already exists it is loaded as-is (this is what "
+                         "makes the split reproducible run to run). If it "
+                         "doesn't exist, it is created from a fresh scan of "
+                         "pc_dir/mesh_dir and saved here.")
+    p.add_argument("--val_split", type=float, default=0.15,
+                    help="Only used when --split_json doesn't exist yet.")
+    p.add_argument("--test_split", type=float, default=0.15,
+                    help="Only used when --split_json doesn't exist yet. "
+                         "Set to 0 if you don't want a held-out test set.")
 
     p.add_argument("--pretrained_ckpt", default=None)
     p.add_argument("--num_latents", type=int, default=256)
@@ -533,18 +434,12 @@ def parse_args():
     p.add_argument("--use_wandb", action="store_true", default=True)
     p.add_argument("--seed", type=int, default=42)
 
-    p.add_argument("--mesh_export_every_n_epochs", type=int, default=20,
-                    help="Export a reconstructed mesh from a fixed val sample "
-                         "every N epochs. Set 0 to disable.")
+    p.add_argument("--mesh_export_every_n_epochs", type=int, default=20)
 
     return p.parse_args()
 
 
 def detect_model_config_from_ckpt(ckpt_path: str) -> dict:
-    """
-    Read the actual architecture hyperparameters from the pretrained checkpoint
-    by inspecting tensor shapes, so the model we build always matches exactly.
-    """
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "state_dict" in sd:
         sd = sd["state_dict"]
@@ -555,26 +450,11 @@ def detect_model_config_from_ckpt(ckpt_path: str) -> dict:
         prefix = "shape_model."
         shape_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
 
-    # width: from the encoder query parameter shape [num_latents, width]
     width = shape_sd["encoder.query"].shape[1]
-
     num_latents_raw = shape_sd["encoder.query"].shape[0]
     num_latents = num_latents_raw - 1
-
-    # embed_dim: from pre_kl weight [embed_dim*2, width] -> embed_dim*2 is out_features
     embed_dim = shape_sd["pre_kl.weight"].shape[0] // 2 if "pre_kl.weight" in shape_sd else 0
 
-    # encoder_layers = sum(1 for k in shape_sd if k.startswith("encoder.self_attn.resblocks."))
-    
-    # print a few transformer keys to confirm structure
-    sample_transformer_keys = [k for k in shape_sd if k.startswith("transformer.")][:5]
-    print(f"[ckpt] sample transformer keys: {sample_transformer_keys}")
-
-    sample_encoder_keys = [k for k in shape_sd if k.startswith("encoder.self_attn.")][:5]
-    print(f"[ckpt] sample encoder keys: {sample_encoder_keys}")
-    
-    # each resblock has 4 keys (attn.in_proj, attn.out_proj, ln_*, mlp)
-    # count unique layer indices
     enc_layer_indices = set(
         int(k.split(".")[3]) for k in shape_sd
         if k.startswith("encoder.self_attn.resblocks.")
@@ -587,20 +467,16 @@ def detect_model_config_from_ckpt(ckpt_path: str) -> dict:
     )
     num_decoder_layers = len(transformer_layer_indices)
 
-    # heads: width / 64 is standard for these models
     heads = width // 64
 
-    # point_feats: from encoder input_proj weight [width, fourier_dim + point_feats]
-    # fourier_dim = num_freqs * 2 * 3 (with pi) + 3 = num_freqs*6 + 3
-    # default num_freqs=8 -> fourier_dim = 51
     input_proj_in = shape_sd["encoder.input_proj.weight"].shape[1]
     num_freqs = 8
-    fourier_dim = num_freqs * 2 * 3 + 3  # include_pi=True
+    fourier_dim = num_freqs * 2 * 3 + 3
     point_feats = input_proj_in - fourier_dim
 
     config = {
         "width": width,
-        "num_latents": num_latents +1,
+        "num_latents": num_latents + 1,
         "embed_dim": embed_dim,
         "heads": heads,
         "num_encoder_layers": num_encoder_layers,
@@ -611,47 +487,64 @@ def detect_model_config_from_ckpt(ckpt_path: str) -> dict:
     print(f"[ckpt] Detected architecture: {config}")
     return config
 
+
 def main():
     args = parse_args()
     pl.seed_everything(args.seed)
 
-    full_dataset = AbdominalDataset(
+    # ── build / load the reproducible split ─────────────────────────────
+    split = split_utils.build_or_load_split(
         pc_dir=args.pc_dir,
         mesh_dir=args.mesh_dir,
-        n_surface=args.n_surface,
-        n_volume=args.n_volume,
-        n_near=args.n_near,
-        # augment=True,
+        split_json=args.split_json,
+        val_frac=args.val_split,
+        test_frac=args.test_split,
+        seed=args.seed,
     )
-    
-    sample = full_dataset[0]
-    pos_ratio = sample["geo_points"][:, 3].mean()
-    print(f"pos_ratio: {pos_ratio:.5f}")
-     
-    n_val   = max(1, int(len(full_dataset) * args.val_split))
-    n_train = len(full_dataset) - n_val
-    train_ds, val_ds = random_split(full_dataset, [n_train, n_val],
-                                    generator=torch.Generator().manual_seed(args.seed))
 
-    val_ds.dataset.augment = False
+    train_pairs = split_utils.keys_to_paths(split["train"], args.pc_dir, args.mesh_dir)
+    val_pairs = split_utils.keys_to_paths(split["val"], args.pc_dir, args.mesh_dir)
+    test_pairs = split_utils.keys_to_paths(split["test"], args.pc_dir, args.mesh_dir)
+
+    # separate dataset INSTANCES per split -- fixes the original bug where
+    # train_ds and val_ds were Subsets of the same underlying object, so
+    # `val_ds.dataset.augment = False` also silently turned off augmentation
+    # for training.
+    train_ds = AbdominalDataset(train_pairs, n_surface=args.n_surface,
+                                 n_volume=args.n_volume, n_near=args.n_near,
+                                 augment=True)
+    val_ds = AbdominalDataset(val_pairs, n_surface=args.n_surface,
+                               n_volume=args.n_volume, n_near=args.n_near,
+                               augment=False)
+    test_ds = AbdominalDataset(test_pairs, n_surface=args.n_surface,
+                                n_volume=args.n_volume, n_near=args.n_near,
+                                augment=False)
+
+    if len(train_ds) > 0:
+        sample = train_ds[0]
+        pos_ratio = sample["geo_points"][:, 3].mean()
+        print(f"pos_ratio: {pos_ratio:.5f}")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+                               num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=True)
+    # test_loader isn't used during training -- evaluate.py reads split.json
+    # directly and runs inference/metrics on the "test" keys after training.
 
-    print(f"Train: {len(train_ds)} samples  |  Val: {len(val_ds)} samples")
+    print(f"Train: {len(train_ds)} samples  |  Val: {len(val_ds)} samples  |  "
+          f"Test: {len(test_ds)} samples (held out, not used until evaluate.py)")
 
     if args.pretrained_ckpt is not None:
         detected = detect_model_config_from_ckpt(args.pretrained_ckpt)
-        args.width        = detected["width"]
-        args.num_latents  = detected["num_latents"]
-        args.embed_dim    = detected["embed_dim"]
-        args.heads        = detected["heads"]
-        args.enc_layers   = detected["num_encoder_layers"]
-        args.dec_layers   = detected["num_decoder_layers"]
-        point_feats       = detected["point_feats"]
-        print(f"[ckpt] Using detected architecture instead of CLI defaults.")
+        args.width = detected["width"]
+        args.num_latents = detected["num_latents"]
+        args.embed_dim = detected["embed_dim"]
+        args.heads = detected["heads"]
+        args.enc_layers = detected["num_encoder_layers"]
+        args.dec_layers = detected["num_decoder_layers"]
+        point_feats = detected["point_feats"]
+        print("[ckpt] Using detected architecture instead of CLI defaults.")
     else:
         point_feats = 3
 
@@ -670,12 +563,12 @@ def main():
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         pretrained_ckpt=args.pretrained_ckpt,
-        mesh_export_every_n_epochs=5
+        mesh_export_every_n_epochs=args.mesh_export_every_n_epochs,
     )
-    
-    model._fixed_val_sample = val_ds[0]
-    
-    # store n_volume on model so _step can split logits correctly
+
+    if len(val_ds) > 0:
+        model._fixed_val_sample = val_ds[0]
+
     model.hparams["n_volume"] = args.n_volume
 
     ckpt_dir = Path(args.output_dir) / args.exp_name / "checkpoints"
@@ -694,7 +587,7 @@ def main():
     ]
 
     cur_time = datetime.datetime.now().strftime("%d_%H-%M-%S")
-    wandb_name = "run_" +cur_time
+    wandb_name = "run_" + cur_time
     logger = None
     if args.use_wandb:
         logger = WandbLogger(
@@ -702,6 +595,8 @@ def main():
             name=wandb_name,
             save_dir=args.output_dir,
         )
+        # record which split file this run used, directly in the wandb config
+        logger.experiment.config.update({"split_json": str(Path(args.split_json).resolve())})
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
@@ -711,7 +606,6 @@ def main():
         callbacks=callbacks,
         logger=logger,
         log_every_n_steps=2,
-        # val_check_interval=1.0,   
         gradient_clip_val=1.0,
         default_root_dir=args.output_dir,
     )
@@ -719,7 +613,8 @@ def main():
     trainer.fit(model, train_loader, val_loader)
 
     print(f"\nTraining complete. Checkpoints saved to {ckpt_dir}")
- 
+    print(f"Split file used: {Path(args.split_json).resolve()}")
+
 
 if __name__ == "__main__":
     main()

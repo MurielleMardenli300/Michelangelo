@@ -4,13 +4,14 @@ import datetime
 
 model = ShapeVAEModule.load_from_checkpoint(
     # '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/epoch=048-val/loss=0.0897.ckpt'
-    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/last-v47.ckpt'
+    '/home/mardenlim/codebases/Michelangelo/output/abdomen_shapevae/checkpoints/last-v48.ckpt'
     # '/home/mardenlim/codebases/Michelangelo/checkpoints/aligned_shape_latents/shapevae-256.ckpt'
 )
 model.eval().cuda()
 
 pcd = o3d.io.read_point_cloud(
-    '/volatile/Datasets/Varian_Motion/point_clouds/norm_pc/test1/pointcloud_00001.ply'
+    # '/volatile/Datasets/Varian_Motion/point_clouds/norm_pc/test1/pointcloud_00001.ply'
+    '/volatile/Datasets/Varian_Motion/chum/9_11/pc/small_antenna_av_filt/averaged_00001.ply'
 )
 pts = np.asarray(pcd.points, np.float32)
 nrm = np.asarray(pcd.normals, np.float32)
