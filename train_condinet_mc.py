@@ -26,13 +26,13 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 
 # ── dataset: cached Michelangelo latents instead of raw image slices ────────────
-from navigator_latent_dataset import NAVIGATOR_LATENT_Dataset_multitime
+from nav_lat_dataset import NAVIGATOR_LATENT_Dataset_multitime
 
 # ── model: unchanged import path/name, just instantiated with backbone_type="michelangelo" ──
-from ..models.temporal.condiNet_Tr_prior_multi import CondiNet_Tr_priormulti
+from condinet_tr_prior_multi import CondiNet_Tr_priormulti
 
-from ..utils.early_stopping import EarlyStopping
-from ..utils.io import cond_mkdir, custom_load
+from ....fellahr.temporal_predictor_pt.utils.early_stopping import EarlyStopping
+from ....fellahr.temporal_predictor_pt.utils.io import cond_mkdir, custom_load
 
 # ── ShapeVAEModule + Michelangelo inference utils, for geometric validation ─────
 sys.path.insert(0, str(Path(__file__).parent))
@@ -396,12 +396,12 @@ def train(folds, dir_name: str = ""):
     log_dir, run_dir = make_run_dirs(opt.logging_dir, dir_name)
     writer = SummaryWriter(run_dir)
     wandb.init(
-        project="Abdominal Surface Motion Model",
+        project="Mamba-Michelangelo",
         name=f"{dir_name}-condinettrprior-michelangelo",
         config=vars(opt),
         dir=log_dir,
         reinit=True,
-        mode="offline",
+        mode="online",
     )
 
     mse_loss = nn.MSELoss(reduction="mean")
