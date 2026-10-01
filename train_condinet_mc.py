@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 warnings.filterwarnings("ignore")
-os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "online"
 
 import numpy as np
 import open3d as o3d
@@ -26,17 +26,26 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 
 # ── dataset: cached Michelangelo latents instead of raw image slices ────────────
-from nav_lat_dataset import NAVIGATOR_LATENT_Dataset_multitime
+from nav_lat_dataset import (
+    NAVIGATOR_LATENT_Dataset_multitime,
+    NAVIGATOR_LATENT_Dataset_temporal_split,
+)
 
 # ── model: unchanged import path/name, just instantiated with backbone_type="michelangelo" ──
 from condinet_tr_prior_multi import CondiNet_Tr_priormulti
 
-from ....fellahr.temporal_predictor_pt.utils.early_stopping import EarlyStopping
-from ....fellahr.temporal_predictor_pt.utils.io import cond_mkdir, custom_load
+import sys
+sys.path.insert(0, "/home/fellahr")  # the PARENT of temporal_predictor_pt
+from temporal_predictor_pt.utils.early_stopping import EarlyStopping
+from temporal_predictor_pt.utils.io import cond_mkdir, custom_load
+
+# from ....fellahr.temporal_predictor_pt.utils.early_stopping import EarlyStopping
+# from ....fellahr.temporal_predictor_pt.utils.io import cond_mkdir, custom_load
 
 # ── ShapeVAEModule + Michelangelo inference utils, for geometric validation ─────
 sys.path.insert(0, str(Path(__file__).parent))
 from train import ShapeVAEModule  # the ShapeVAEModule defined earlier in this project
+from vae_loading import load_shapevae
 from michelangelo.models.tsal.inference_utils import extract_geometry
 
 # ---------------------------------------------------------------------------
@@ -57,9 +66,23 @@ parser.add_argument("--ply_dir", required=True,
 parser.add_argument("--shapevae_ckpt", required=True,
                     help="Trained ShapeVAEModule checkpoint -- provides the decoder "
                          "used for periodic geometric validation.")
+parser.add_argument("--split_mode", choices=["participant", "temporal"], default="participant",
+                    help="'participant' (default): --train_participants_file and "
+                         "--val_participants_file list DIFFERENT sequence/folder names, "
+                         "via make_participant_splits.py -- needs >= 2 sequences. "
+                         "'temporal': for a SINGLE sequence -- both files are ignored "
+                         "except --train_participants_file, which lists ALL sequence(s) "
+                         "to use; train/val are split by frame index within each "
+                         "sequence instead (see navigator_latent_dataset.py's docstring "
+                         "for why this is a weaker validation signal than held-out "
+                         "participants).")
 parser.add_argument("--train_participants_file", required=True,
-                    help="Text file, one participant folder name per line.")
-parser.add_argument("--val_participants_file", required=True)
+                    help="Text file, one sequence/folder name per line. In --split_mode "
+                         "temporal, this is the list of ALL sequences to use.")
+parser.add_argument("--val_participants_file", default=None,
+                    help="Required for --split_mode participant. Unused for --split_mode temporal.")
+parser.add_argument("--val_frac", type=float, default=0.2,
+                    help="Only used with --split_mode temporal.")
 parser.add_argument("--name",        type=str, default="condinet_michelangelo")
 parser.add_argument("--gpu_idx",     type=str, default="0")
 parser.add_argument(
@@ -87,7 +110,7 @@ parser.add_argument("--prior_type",       type=str,   default="learned",
 
 # Michelangelo latent shape -- MUST match the ShapeVAEModule these latents came from
 parser.add_argument("--michelangelo_embed_dim",   type=int, default=64)
-parser.add_argument("--michelangelo_num_latents", type=int, default=256,
+parser.add_argument("--michelangelo_num_latents", type=int, default=257,
                     help="Number of latent tokens per frame. If your ShapeVAEModule's "
                          "encoder.query has num_latents+1 rows (a leading CLS-style "
                          "token), verify latents.shape from encode() and adjust this "
@@ -347,8 +370,7 @@ def train(folds, dir_name: str = ""):
 
     # ---- ShapeVAEModule, for geometric validation only (frozen, eval mode) ----
     print(f"Loading ShapeVAEModule (frozen, for geometric validation) from {opt.shapevae_ckpt}")
-    shape_model = ShapeVAEModule.load_from_checkpoint(opt.shapevae_ckpt)
-    shape_model.eval().to(device)
+    shape_model = load_shapevae(opt.shapevae_ckpt, device)
     for param in shape_model.parameters():
         param.requires_grad_(False)
 
@@ -363,22 +385,24 @@ def train(folds, dir_name: str = ""):
     )
 
     # ---- Data ----
-    train_set = NAVIGATOR_LATENT_Dataset_multitime(
-        opt.latent_cache_dir,
-        nb_inputs=opt.nb_inputs,
-        sequence_list=folds[0],
-        nb_pred=opt.tp,
-        mode="train",
-        stride=opt.sample_stride,
-    )
-    valid_set = NAVIGATOR_LATENT_Dataset_multitime(
-        opt.latent_cache_dir,
-        nb_inputs=opt.nb_inputs,
-        sequence_list=folds[1],
-        nb_pred=opt.tp,
-        mode="val",
-        stride=opt.sample_stride,
-    )
+    if opt.split_mode == "participant":
+        train_set = NAVIGATOR_LATENT_Dataset_multitime(
+            opt.latent_cache_dir, nb_inputs=opt.nb_inputs, sequence_list=folds[0],
+            nb_pred=opt.tp, mode="train", stride=opt.sample_stride,
+        )
+        valid_set = NAVIGATOR_LATENT_Dataset_multitime(
+            opt.latent_cache_dir, nb_inputs=opt.nb_inputs, sequence_list=folds[1],
+            nb_pred=opt.tp, mode="val", stride=opt.sample_stride,
+        )
+    else:  # temporal -- folds[0] == folds[1] == the same full sequence list
+        train_set = NAVIGATOR_LATENT_Dataset_temporal_split(
+            opt.latent_cache_dir, nb_inputs=opt.nb_inputs, sequence_list=folds[0],
+            nb_pred=opt.tp, mode="train", val_frac=opt.val_frac, stride=opt.sample_stride,
+        )
+        valid_set = NAVIGATOR_LATENT_Dataset_temporal_split(
+            opt.latent_cache_dir, nb_inputs=opt.nb_inputs, sequence_list=folds[1],
+            nb_pred=opt.tp, mode="val", val_frac=opt.val_frac, stride=opt.sample_stride,
+        )
     print(len(train_set), "training samples")
     print(len(valid_set), "validation samples")
 
@@ -396,7 +420,7 @@ def train(folds, dir_name: str = ""):
     log_dir, run_dir = make_run_dirs(opt.logging_dir, dir_name)
     writer = SummaryWriter(run_dir)
     wandb.init(
-        project="Mamba-Michelangelo",
+        project="Abdominal Surface Motion Model",
         name=f"{dir_name}-condinettrprior-michelangelo",
         config=vars(opt),
         dir=log_dir,
@@ -579,9 +603,19 @@ def validate(condinet, valid_loader, mse_loss, device):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    train_participants = read_participant_list(opt.train_participants_file)
-    val_participants = read_participant_list(opt.val_participants_file)
-    print(f"Train participants ({len(train_participants)}): {train_participants}")
-    print(f"Val participants ({len(val_participants)}): {val_participants}")
+    sequences = read_participant_list(opt.train_participants_file)
+    print(f"Sequences ({len(sequences)}): {sequences}")
 
-    train((train_participants, val_participants), dir_name=opt.name)
+    if opt.split_mode == "participant":
+        if not opt.val_participants_file:
+            raise SystemExit("--val_participants_file is required for --split_mode participant "
+                              "(or use --split_mode temporal if you only have one sequence).")
+        val_sequences = read_participant_list(opt.val_participants_file)
+        print(f"Val sequences ({len(val_sequences)}): {val_sequences}")
+        folds = (sequences, val_sequences)
+    else:
+        # temporal split: same sequence list feeds both -- NAVIGATOR_LATENT_Dataset_temporal_split
+        # is what actually separates train/val, by frame index within each sequence.
+        folds = (sequences, sequences)
+
+    train(folds, dir_name=opt.name)

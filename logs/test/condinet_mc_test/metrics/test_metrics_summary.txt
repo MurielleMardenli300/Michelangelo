@@ -1,0 +1,25 @@
+============================================================================
+CondiNet (Michelangelo latents) test results
+Checkpoint : /home/mardenlim/codebases/Michelangelo/saved_models/condinet_tr_prior_michelangelo.pth
+N samples  : 112
+============================================================================
+
+── Latent MSE ──────────────────────────────────────────────────────
+  MSE (posterior path)                mean=0.08725  std=0.01941  min=0.05649  max=0.17080  n=112/112
+  MSE (prior path)                    mean=0.08724  std=0.01940  min=0.05656  max=0.17074  n=112/112
+
+── Geometric error (mm, normalized space) ───────────────────────────
+  prior vs. posterior mesh            mean=0.01181  std=0.00009  min=0.01156  max=0.01209  n=112/112
+  prior vs. TRUE future point cloud   mean=0.04882  std=0.00116  min=0.04559  max=0.05319  n=112/112
+
+── Prior-posterior feature alignment ────────────────────────────────
+  Cosine similarity                   mean=0.99997  std=0.00001  min=0.99993  max=0.99998  n=112/112
+  Feature L2 distance                 mean=0.75752  std=0.09774  min=0.55476  max=1.06734  n=112/112
+
+── Floor comparison ─────────────────────────────────────────────────
+  MSE (Copy-Last floor)               mean=0.15271  std=0.03146  min=0.09235  max=0.27871  n=112/112
+  Model (prior) vs Copy-Last floor = +0.06546  (positive = model beats floor)
+  Posterior (ceiling) vs prior     = -0.00001  (headroom if the model could see the future)
+
+[note] No Copy-Ref floor: the original image data had a baked-in reference channel per sample; latent samples here have no equivalent.
+============================================================================

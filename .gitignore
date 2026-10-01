@@ -8,6 +8,8 @@
 *.ply
 output/
 *.db
+*.pth
+*.npz
 
 # store
 *.pyc

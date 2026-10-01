@@ -11,8 +11,14 @@ from positional_encodings.torch_encodings import (
     PositionalEncoding1D,
     PositionalEncodingPermute3D,
 )
-from .transformer import Transformer
-from .priors import kl_criterion, Gaussian_Enc, Gaussian_TR
+
+# from ....fellahr.temporal_predictor_pt.models.temporal.transformer import Transformer
+# from ....fellahr.temporal_predictor_pt.models.temporal.priors import kl_criterion, Gaussian_Enc, Gaussian_TR
+
+import sys
+sys.path.insert(0, "/home/fellahr")  # the PARENT of temporal_predictor_pt
+from temporal_predictor_pt.models.temporal.transformer import Transformer
+from temporal_predictor_pt.models.temporal.priors import kl_criterion, Gaussian_Enc, Gaussian_TR
 
 
 # ---------------------------------------------------------------------------------

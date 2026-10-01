@@ -536,6 +536,7 @@ def main():
           f"Test: {len(test_ds)} samples (held out, not used until evaluate.py)")
 
     if args.pretrained_ckpt is not None:
+        # Get model parameters from checkpoint (same architecture as pretrained weights)
         detected = detect_model_config_from_ckpt(args.pretrained_ckpt)
         args.width = detected["width"]
         args.num_latents = detected["num_latents"]
