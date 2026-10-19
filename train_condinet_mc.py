@@ -1,3 +1,8 @@
+"""
+Temporal Conditional Network using mesh encodings as input 
+"""
+
+
 from __future__ import annotations
 
 import argparse

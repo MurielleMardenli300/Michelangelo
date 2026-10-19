@@ -10,6 +10,7 @@ output/
 *.db
 *.pth
 *.npz
+*.nii.gz
 
 # store
 *.pyc
@@ -17,3 +18,8 @@ output/
 events.*
 *.safetensors
 wandb/*
+*.wandb
+latest-run
+*.npy
+
+*.txt

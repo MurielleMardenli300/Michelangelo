@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 """
-Train / validate / test the Mamba-conditioned DDIM model with strong multiscale
-3D reference-volume conditioning.
+Train / validate / test the temporal-token-conditioned DDIM model with strong
+multiscale 3D reference-volume conditioning.
 
 Compared with the previous diffusion training file:
 - same lung dataset / 5-fold workflow
@@ -10,10 +10,12 @@ Compared with the previous diffusion training file:
 - same VAE latent-diffusion option
 - same DDIM train/inference path
 - same NCC / MSE / SSIM / geometric-error test outputs
-- Mamba receives only observed input frames
-- NEW: Vref is encoded spatially and injected at every UNet resolution
-- NEW: temporal Mamba feature conditions every residual block through FiLM
-- real stride-2 diffusion UNet hierarchy is used
+- the temporal predictor receives only observed input frames (plus future
+  frames during training if it is a trainable posterior model)
+- Vref is encoded spatially and injected at every UNet resolution
+- the temporal feature conditions every residual block through FiLM
+- NEW: --temporal_predictor condinet_surface feeds an abdominal-surface
+  sequence (Sseq) instead of 2D navigator slices (Iseq)
 """
 
 # =========================
@@ -21,11 +23,13 @@ Compared with the previous diffusion training file:
 # =========================
 import argparse
 import datetime
+import importlib
+import json
 import os
 import warnings
 
 warnings.filterwarnings("ignore")
-os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "online"
 
 # =========================
 # Third-party
@@ -50,7 +54,7 @@ from diffusion_spatial_mamba_ref import (
 )
 
 import sys
-sys.path.insert(0, "/home/fellahr/4D_MoPred") 
+sys.path.insert(0, "/home/fellahr/4D_MoPred")
 
 from data.data_loaders.navigator_4d import NAVIGATOR_4D_Dataset_multitime_v2
 from models import SpatialTransformer, Voxelmorph
@@ -81,7 +85,8 @@ parser.add_argument("--train_test", type=str, required=True, choices=["train", "
 parser.add_argument("--logging_dir", required=True)
 parser.add_argument(
     "--data_dir",
-    default="/home/fellahr/data/dataset_split",
+    # default="/home/fellahr/data/dataset_split",
+    default="/home/mardenlim/codebases/Michelangelo/diffusion/lung_data",
 )
 parser.add_argument("--name", type=str, default="diffusion_mamba_spatial_ref")
 parser.add_argument("--gpu_idx", type=int, default=0)
@@ -114,8 +119,25 @@ parser.add_argument("--condi_type", type=str, default="2", choices=["1", "2"])
 parser.add_argument("--nb_inputs", type=int, default=3)
 parser.add_argument("--tp", type=int, default=1)
 
-parser.add_argument("--temporal_predictor", type=str, default="mamba",
-                     choices=["mamba", "condinet_tr", "convlstm", "lstm", "gru"])
+parser.add_argument(
+    "--temporal_predictor",
+    type=str,
+    default="mamba",
+    choices=["mamba", "condinet_tr", "convlstm", "lstm", "gru", "condinet_surface", "phase"],
+    help="'phase' = condition on the target respiratory phase (from the 4D "
+         "filenames during training; from any phase forecaster at deployment).",
+)
+parser.add_argument(
+    "--phase_harmonics", type=int, default=2,
+    help="phase mode: number of sin/cos harmonics. Low values interpolate "
+         "more smoothly between the 10 discrete 4D phase bins.",
+)
+parser.add_argument(
+    "--phase_noise_std", type=float, default=0.02,
+    help="phase mode: Gaussian jitter (fraction of a cycle) added to training "
+         "phases. Smooths conditioning between bins and makes the model "
+         "tolerant to forecaster errors. 0 disables.",
+)
 # -------------------------
 # Mamba conditioning network
 # -------------------------
@@ -130,23 +152,23 @@ parser.add_argument("--mamba_headdim", type=int, default=64)
 parser.add_argument("--mamba3_mimo", action="store_true")
 parser.add_argument("--mamba3_mimo_rank", type=int, default=4)
 parser.add_argument(
-    "--cond_net_checkpoint", # path to pretrained temporal predictor
+    "--cond_net_checkpoint",  # path to pretrained temporal predictor
     type=str,
     default="",
-    help="Checkpoint for the pretrained Mamba temporal predictor.",
+    help="Checkpoint for the pretrained temporal predictor.",
 )
 parser.add_argument(
     "--freeze_cond_net",
     dest="freeze_cond_net",
     action="store_true",
     default=True,
-    help="Freeze the pretrained Mamba (default).",
+    help="Freeze the pretrained temporal predictor (default).",
 )
 parser.add_argument(
     "--finetune_cond_net",
     dest="freeze_cond_net",
     action="store_false",
-    help="Fine-tune Mamba jointly with diffusion instead of freezing it.",
+    help="Fine-tune the temporal predictor jointly with diffusion instead of freezing it.",
 )
 
 
@@ -157,10 +179,48 @@ parser.add_argument("--prelatent_size", type=int,  default=64)
 parser.add_argument("--enc_layers",     type=int,  default=5)
 parser.add_argument("--dec_layers",     type=int,  default=5)
 parser.add_argument("--n_heads",        type=int,  default=8)
-parser.add_argument("--norm_before",    type=bool, default=True)
+parser.add_argument("--norm_before",    action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--condi_channels", nargs="+", type=int, default=[16, 32, 64, 128])
 parser.add_argument("--enc_channels",   nargs="+", type=int, default=[16, 32, 64, 128])
 parser.add_argument("--prior_type",     type=str,  default="learned", choices=["learned", "none"])
+
+# -------------------------
+# Abdominal-surface temporal predictor (condinet_surface)
+# -------------------------
+parser.add_argument(
+    "--surface_module", type=str, default="",
+    help="Python module of the surface model class (overrides the default "
+         "set in temporal_predictors.py).",
+)
+parser.add_argument(
+    "--surface_class", type=str, default="",
+    help="Class name of the surface model (overrides the default set in "
+         "temporal_predictors.py).",
+)
+parser.add_argument(
+    "--surface_kwargs", type=str, default="",
+    help='Extra constructor kwargs for the surface model as JSON, e.g. '
+         '\'{"n_points": 2048, "enc_layers": 5}\'. Must match the run that '
+         'produced --cond_net_checkpoint.',
+)
+parser.add_argument(
+    "--surface_fn", type=str, default="",
+    help='"module:function" that turns ONE volume [B,1,D,H,W] into ONE '
+         'surface frame [B,C,...]. Use the SAME function/preprocessing as in '
+         'the surface model training script.',
+)
+parser.add_argument(
+    "--surface_time_dim", type=int, default=2,
+    help="Axis along which surface frames are stacked into Sseq. With "
+         "frames [B,C,...] the default 2 gives [B,C,T,...].",
+)
+parser.add_argument(
+    "--surface_uses_posterior",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override whether the surface model needs future frames when it is "
+         "fine-tuned (default: True, CondiNet-style posterior).",
+)
 
 # -------------------------
 # LSTM temporal predictor
@@ -303,25 +363,13 @@ parser.add_argument(
 )
 parser.add_argument("--dvf_downsample_factor", type=float, default=1.0)
 parser.add_argument("--gtv_landmarks_csv", type=str, default="/home/fellahr/data/gtv_landmarks_final_128x80x64_1x1x2.csv")
+
 # -------------------------
 # Classifier-free guidance
 # -------------------------
-# parser.add_argument(
-#     "--cfg_dropout",
-#     type=float,
-#     default=0.30,
-#     help="Drops only Mamba temporal context; Vref is always retained.",
-# )
-# parser.add_argument(
-#     "--cfg_guidance_scale",
-#     type=float,
-#     default=3.0,
-#     help="Start at 1.0 for quantitative DVF regression; sweep later if desired.",
-# )
-
 parser.add_argument(
     "--cfg_dropout_temporal", type=float, default=0.15,
-    help="Prob. of replacing the Mamba temporal token with the learned null token in training.",
+    help="Prob. of replacing the temporal token with the learned null token in training.",
 )
 parser.add_argument(
     "--cfg_dropout_vref", type=float, default=0.15,
@@ -383,11 +431,12 @@ vm = Voxelmorph(
 stn = SpatialTransformer(VOL_SIZE).to(device)
 
 
-
 # ============================================================================
 # Model construction
 # ============================================================================
 def build_temporal_kwargs(opt):
+    if opt.temporal_predictor == "phase":
+        return {}
     if opt.temporal_predictor == "mamba":
         return dict(
             preset=opt.preset,
@@ -411,6 +460,20 @@ def build_temporal_kwargs(opt):
             condi_type=opt.condi_type,
             prior_type=opt.prior_type,
         )
+
+    if opt.temporal_predictor == "condinet_surface":
+        kw = json.loads(opt.surface_kwargs) if opt.surface_kwargs else {}
+        if not isinstance(kw, dict):
+            raise ValueError("--surface_kwargs must be a JSON object")
+        if opt.surface_module:
+            kw["surface_module"] = opt.surface_module
+        if opt.surface_class:
+            kw["surface_class"] = opt.surface_class
+        # Adapter-level options, consumed by build_temporal_predictor.
+        kw["input_time_dim"] = opt.surface_time_dim
+        if opt.surface_uses_posterior is not None:
+            kw["uses_posterior"] = opt.surface_uses_posterior
+        return kw
 
     if opt.temporal_predictor == "convlstm":
         return dict(
@@ -448,8 +511,8 @@ def build_model() -> DiffusionMambaSpatialRefModel:
             base_channels=opt.vae_base_channels,
             latent_channels=opt.vae_latent_channels,
             depth=opt.vae_depth,
-            use_alpf = opt.use_alpf, # eventually add a param
-            use_ahpf = opt.use_ahpf, # eventually add a param
+            use_alpf=opt.use_alpf,
+            use_ahpf=opt.use_ahpf,
         ).to(device)
         custom_load(vae, opt.vae_checkpoint, device)
         if opt.freeze_vae:
@@ -494,60 +557,24 @@ def build_model() -> DiffusionMambaSpatialRefModel:
         cfg_dropout_vref=opt.cfg_dropout_vref,
         cfg_scale_temporal=opt.cfg_scale_temporal,
         cfg_scale_vref=opt.cfg_scale_vref,
+        phase_harmonics=opt.phase_harmonics,
     ).to(device)
 
     return model
 
 
-
-
 # ============================================================================
-# Build Mamba input sequence
+# Temporal-predictor inputs
 # ============================================================================
-# def build_Iseq(ref_volume, input_volume_list, opt, device):
-#     """Build observed respiratory sequence for Mamba.
-
-#     Returns [B, 2, nb_inputs, H, W].
-
-#     Unlike the Transformer training script, no future target slices are appended.
-#     Mamba receives only observed history and predicts horizon future tokens itself.
-#     """
-#     if opt.condi_type == "1":
-#         z = ref_volume.shape[2] // 2
-#         ref_slice = ref_volume[:, :, z, :, :]
-#         seq = []
-#         for q in range(len(input_volume_list)):
-#             cur_slice = input_volume_list[q].unsqueeze(1)[:, :, z, :, :]
-#             seq.append(
-#                 torch.cat(
-#                     [cur_slice.to(device), ref_slice.to(device)],
-#                     dim=1,
-#                 )
-#             )
-#     else:
-#         y = ref_volume.shape[3] // 2
-#         ref_slice = ref_volume[:, :, :, y, :]
-#         seq = []
-#         for q in range(len(input_volume_list)):
-#             cur_slice = input_volume_list[q].unsqueeze(1)[:, :, :, y, :]
-#             seq.append(
-#                 torch.cat(
-#                     [cur_slice.to(device), ref_slice.to(device)],
-#                     dim=1,
-#                 )
-#             )
-
-#     Iseq = torch.stack(seq, dim=2).contiguous().to(device)
-#     return Iseq
-
 def build_Iseq(ref_volume, input_volume_list, opt, device, future_volume_list=None):
+    """2D navigator sequence [B, 2, T, H, W] = [current slice, reference slice]."""
     if opt.condi_type == "1":
         idx, dim = ref_volume.shape[2] // 2, 2
     else:
         idx, dim = ref_volume.shape[3] // 2, 3
 
     def _slice(vol):
-        return vol.unsqueeze(1).narrow(dim, idx, 1).squeeze(dim)  # generalizes the old z/y indexing
+        return vol.unsqueeze(1).narrow(dim, idx, 1).squeeze(dim)
 
     ref_slice = ref_volume.narrow(dim, idx, 1).squeeze(dim)
     seq = [torch.cat([_slice(v).to(device), ref_slice.to(device)], dim=1) for v in input_volume_list]
@@ -556,6 +583,109 @@ def build_Iseq(ref_volume, input_volume_list, opt, device, future_volume_list=No
         seq += [torch.cat([_slice(v).to(device), ref_slice.to(device)], dim=1) for v in future_volume_list]
 
     return torch.stack(seq, dim=2).contiguous().to(device)
+
+
+_SURFACE_FN = None
+
+
+def get_surface_fn():
+    """Load the volume -> surface function given by --surface_fn (cached)."""
+    global _SURFACE_FN
+    if _SURFACE_FN is not None:
+        return _SURFACE_FN
+
+    if not opt.surface_fn or ":" not in opt.surface_fn:
+        raise NotImplementedError(
+            "--temporal_predictor condinet_surface needs --surface_fn "
+            "'module:function' pointing at the SAME volume->surface extraction "
+            "used to train the surface model. The function must map one "
+            "volume [B,1,D,H,W] to one surface frame [B,C,...]."
+        )
+
+    module_name, fn_name = opt.surface_fn.split(":", 1)
+    _SURFACE_FN = getattr(importlib.import_module(module_name), fn_name)
+    print(f"[Surface] Using surface extractor {module_name}.{fn_name}")
+    return _SURFACE_FN
+
+
+def build_Sseq(input_volume_list, device, future_volume_list=None):
+    """Abdominal-surface sequence: frames stacked along --surface_time_dim.
+
+    With per-frame surfaces [B,C,...] and the default time dim 2 the result is
+    [B,C,T,...], where T = nb_inputs (+ tp future frames when requested).
+    """
+    surface_fn = get_surface_fn()
+
+    volumes = list(input_volume_list)
+    if future_volume_list is not None:
+        volumes += list(future_volume_list)
+
+    frames = []
+    for vol in volumes:
+        vol = vol.to(device)
+        if vol.dim() == 4:          # dataset gives [B,D,H,W]
+            vol = vol.unsqueeze(1)  # -> [B,1,D,H,W]
+        surface = surface_fn(vol)
+        if not torch.is_tensor(surface) or surface.dim() < 2:
+            raise ValueError(
+                "--surface_fn must return a tensor [B,C,...], got "
+                f"{type(surface) if not torch.is_tensor(surface) else tuple(surface.shape)}"
+            )
+        frames.append(surface.to(device))
+
+    return torch.stack(frames, dim=opt.surface_time_dim).contiguous()
+
+
+def phases_from_vol_file(vol_file, horizon, device):
+    """Target respiratory phase per horizon step from the 4D filenames.
+
+    vol_file[t] holds the B file paths of future frame t (same convention the
+    test loop uses for saving). Returns [B, horizon] in [0,1), e.g. 30% -> 0.3.
+    """
+    if vol_file is None or len(vol_file) < horizon:
+        raise ValueError(
+            "phase mode needs the dataset's file paths (4th batch item) with "
+            f"at least {horizon} future entries; got "
+            f"{None if vol_file is None else len(vol_file)}."
+        )
+    columns = []
+    for t in range(horizon):
+        paths = vol_file[t]
+        if isinstance(paths, str):
+            paths = [paths]
+        values = []
+        for path in paths:
+            label = extract_phase_label(path)
+            try:
+                values.append(float(label) / 100.0)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Could not parse a numeric phase from {path!r} "
+                    f"(extract_phase_label returned {label!r})."
+                )
+        columns.append(torch.tensor(values, dtype=torch.float32))
+    return (torch.stack(columns, dim=1) % 1.0).to(device)
+
+
+def build_temporal_inputs(model, ref_volume, input_volume_list, future_volume_list=None):
+    """Return (Iseq, Sseq); only the one the temporal predictor reads is built."""
+    if model.uses_phase_input:
+        return None, None
+    if model.uses_surface_input:
+        return None, build_Sseq(
+            input_volume_list,
+            device,
+            future_volume_list=future_volume_list,
+        )
+    return build_Iseq(
+        ref_volume,
+        input_volume_list,
+        opt,
+        device,
+        future_volume_list=future_volume_list,
+    ), None
+
+
 # ============================================================================
 # Training
 # ============================================================================
@@ -592,12 +722,12 @@ def train(folds=None, dir_name=None):
     save_params_txt(opt, log_dir)
     writer = SummaryWriter(run_dir)
     wandb.init(
-        project="4DCT Lungs Motion Model",
+        project="Diffusion surface-conditioned",
         name=f"{dir_name}",
         config=vars(opt),
         dir=log_dir,
         reinit=True,
-        mode="offline",
+        mode="online",
     )
 
     train_set = NAVIGATOR_4D_Dataset_multitime_v2(opt.data_dir, nb_inputs=opt.nb_inputs, sequence_list=folds[0], nb_pred=opt.tp)
@@ -629,20 +759,21 @@ def train(folds=None, dir_name=None):
         epoch_steps = 0
         model.train()
 
-        for ref_volume, input_volume_list, current_volume_list, _ in Bar(train_loader):
+        for ref_volume, input_volume_list, current_volume_list, vol_file in Bar(train_loader):
             optimizer.zero_grad(set_to_none=True)
 
             ref_volume = ref_volume.unsqueeze(1).to(device)
             current_vols = [vol.unsqueeze(1).to(device) for vol in current_volume_list]
 
-            # Ground-truth DVFs are generated by frozen Voxelmorph, exactly as in
-            # the Transformer diffusion training script.
+            # Ground-truth DVFs are generated by frozen Voxelmorph.
             with torch.no_grad():
                 dvf_gt = [vm(ref_volume, v) for v in current_vols]
 
-            # Mamba only receives the observed past sequence.
+            # Future frames are only appended for a trainable posterior model
+            # (fine-tuned CondiNet / surface CondiNet).
             needs_future = (
-                model.cond_net.training
+                model.cond_net is not None
+                and model.cond_net.training
                 and getattr(
                     model.cond_net,
                     "requires_future_for_training",
@@ -650,25 +781,28 @@ def train(folds=None, dir_name=None):
                 )
             )
 
-            future_vols = (
-                current_volume_list
-                if needs_future
-                else None
-            )
-
-            Iseq = build_Iseq(
+            Iseq, Sseq = build_temporal_inputs(
+                model,
                 ref_volume,
                 input_volume_list,
-                opt,
-                device,
-                future_volume_list=future_vols,
+                future_volume_list=current_volume_list if needs_future else None,
             )
+
+            phase = None
+            if model.uses_phase_input:
+                phase = phases_from_vol_file(vol_file, opt.tp, device)
+                if global_step == 0:
+                    print(f"[Phase] first training batch target phases:\n{phase.cpu()}")
+                if opt.phase_noise_std > 0.0:
+                    phase = (phase + opt.phase_noise_std * torch.randn_like(phase)) % 1.0
 
             diff_loss = model(
                 ref_volume,
                 Iseq,
                 dvf_gt_list=dvf_gt,
                 return_components=False,
+                Sseq=Sseq,
+                phase=phase,
             )
 
             loss = diff_loss
@@ -759,17 +893,23 @@ def validate(model, vm, valid_loader, opt, device):
     n = 0
     mse_metric = nn.MSELoss(reduction="mean").to(device)
 
-    for ref_volume, input_volume_list, current_volume_list, _ in Bar(valid_loader):
+    for ref_volume, input_volume_list, current_volume_list, vol_file in Bar(valid_loader):
         ref_volume = ref_volume.unsqueeze(1).to(device)
         current_vols = [vol.unsqueeze(1).to(device) for vol in current_volume_list]
 
-        Iseq = build_Iseq(ref_volume, input_volume_list, opt, device)
+        # Observed history only (prior path for posterior models).
+        Iseq, Sseq = build_temporal_inputs(model, ref_volume, input_volume_list)
+        phase = (
+            phases_from_vol_file(vol_file, opt.tp, device)
+            if model.uses_phase_input else None
+        )
         generated_dvf_list, generated_Vn_list = model.forward_inference(
             ref_volume,
             Iseq,
-            # cfg_scale=opt.cfg_guidance_scale,
             cfg_scale_temporal=opt.cfg_scale_temporal,
             cfg_scale_vref=opt.cfg_scale_vref,
+            Sseq=Sseq,
+            phase=phase,
         )
 
         avg_mse_image = 0.0
@@ -852,15 +992,24 @@ def test(fold=None, dir_name=None):
             dvf.append(dvf_vm)
             vmorph_volume.append(stn(ref_volume, dvf_vm))
 
-        # Same observed Mamba input used in train/validation/test.
-        Iseq = build_Iseq(ref_volume, input_volume_list, opt, device)
+        # Same observed input used in train/validation/test.
+        Iseq, Sseq = build_temporal_inputs(model, ref_volume, input_volume_list)
+
+        # Phase mode: ORACLE target phase from the filenames. This measures
+        # the diffusion model alone (upper bound); at deployment the phase
+        # comes from the camera-surface phase forecaster instead.
+        phase = (
+            phases_from_vol_file(vol_file, opt.tp, device)
+            if model.uses_phase_input else None
+        )
 
         generated_dvf_list, generated_current_volume = model.forward_inference(
             ref_volume,
             Iseq,
-            # cfg_scale=opt.cfg_guidance_scale,
             cfg_scale_temporal=opt.cfg_scale_temporal,
             cfg_scale_vref=opt.cfg_scale_vref,
+            Sseq=Sseq,
+            phase=phase,
         )
 
         aff = nib.load(vol_file[0][0]).affine
@@ -893,22 +1042,6 @@ def test(fold=None, dir_name=None):
                 iter=saved_phase,
                 aff=aff,
             )
-
-            # Uncomment if you also want DVFs saved.
-            # save_tensor_as_nifti(
-            #     generated_dvf_list[tp][0],
-            #     "generated_dvfs",
-            #     patient_vol_dir,
-            #     iter=saved_phase,
-            #     aff=aff,
-            # )
-            # save_tensor_as_nifti(
-            #     dvf[tp][0],
-            #     "DVFs_GT",
-            #     patient_vol_dir,
-            #     iter=saved_phase,
-            #     aff=aff,
-            # )
 
             phase_key = extract_phase_label(vol_file[tp][0])
             if phase_key not in phase_metrics:
@@ -956,15 +1089,7 @@ def test(fold=None, dir_name=None):
             this_sample.append(np.ravel(err))
             phase_metrics[phase_key]["geo_error"].append(float(np.mean(err)))
 
-            # --------------------------------------------------------------
             # GTV target-registration error (VM-relative), in millimeters.
-            #
-            # The phase-50 CSV provides only the reference tumor centroid.
-            # Both generated and GT VoxelMorph DVFs are backward warp fields,
-            # so each field is inverted at that reference point to recover the
-            # corresponding target-phase GTV position. Their Euclidean
-            # difference is then measured in physical mm.
-            # --------------------------------------------------------------
             if patient_gtv is not None:
                 tre_mm, pred_ok, gt_ok, pred_res, gt_res = (
                     gtv_tre_from_backward_dvfs(
@@ -972,8 +1097,6 @@ def test(fold=None, dir_name=None):
                         gt_dvf=dvf[tp],
                         ref_xyz=patient_gtv["xyz"],
                         spacing_xyz=patient_gtv["spacing"],
-                        # max_iter=opt.gtv_inverse_max_iter,
-                        # tol=opt.gtv_inverse_tol,
                     )
                 )
 
@@ -982,9 +1105,6 @@ def test(fold=None, dir_name=None):
                 if not gt_ok:
                     gtv_nonconverged_gt += 1
 
-                # Keep the value, but report non-convergence counts below.
-                # The residuals make it easy to diagnose if inversion ever
-                # becomes unreliable.
                 this_gtv_tre.append(tre_mm)
                 phase_metrics[phase_key]["gtv_tre_mm"].append(tre_mm)
 
@@ -993,8 +1113,6 @@ def test(fold=None, dir_name=None):
         SSIM_loss.append(avg_ssim / opt.tp)
         geo_error.append(this_sample)
 
-        # Match the other test arrays: one scalar per test sample/patient
-        # (averaged across the requested future horizons).
         if this_gtv_tre:
             GTV_TRE.append(float(np.mean(this_gtv_tre)))
 
@@ -1053,6 +1171,8 @@ def test(fold=None, dir_name=None):
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
 # ============================================================================
 # Entry point
 # ============================================================================

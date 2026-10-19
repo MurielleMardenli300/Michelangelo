@@ -2,12 +2,17 @@ from __future__ import annotations
 
 
 """
-Mamba-conditioned DDIM diffusion for 3D DVF prediction with STRONG SPATIAL
-REFERENCE CONDITIONING.
+Temporal-token-conditioned DDIM diffusion for 3D DVF prediction with STRONG
+SPATIAL REFERENCE CONDITIONING.
 
 Core design
 -----------
-1) Mamba predicts future temporal tokens from the observed 2D respiratory sequence.
+1) A temporal predictor (Mamba, CondiNet, ConvLSTM, LSTM, GRU, or the abdominal
+   surface CondiNet) predicts future temporal tokens from an observed
+   respiratory sequence. Depending on the predictor, that sequence is either
+   the 2D navigator slices (Iseq) or the abdominal surfaces (Sseq).
+   With temporal_predictor="phase" no network is used: the model is
+   conditioned directly on the target respiratory phase (Fourier features).
 2) Vref is NEVER collapsed to a global vector. A trainable 3D reference encoder
    builds a spatial feature map at the diffusion resolution and a multiscale
    reference pyramid matching the denoising UNet.
@@ -18,11 +23,8 @@ Core design
    FiLM.
 5) Reference features are injected at EVERY UNet resolution on the down path,
    bottleneck, and up path.
-6) CFG is kept, but it drops ONLY the temporal Mamba context. Vref is present in
-   both conditional and unconditional branches.
-
-This file is intended as the spatially-conditioned replacement for
-`diffusion_mamba_ddim.py`.
+6) Two-axis CFG: the temporal context and Vref are dropped independently during
+   training, and guided separately at inference.
 """
 
 import math
@@ -32,13 +34,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from temporal_predictors import build_temporal_predictor
 import sys
 sys.path.insert(0, "/home/fellahr/4D_MoPred")  # the PARENT of temporal_predictor_pt
 from models.spatial_transform import SpatialTransformer
-from models.temporal.mamba.lung_edge_true_mamba import build_lung_edge_mamba_forecaster
-from models.temporal.temporal_predictors import build_temporal_predictor
-from utils.io import custom_load
-
 
 
 # =============================================================================
@@ -49,6 +48,16 @@ def _groups(channels: int, maximum: int = 32) -> int:
         if channels % g == 0:
             return g
     return 1
+
+
+def encode_phase(phase: torch.Tensor, harmonics: int) -> torch.Tensor:
+    """Respiratory phase in [0,1) -> [B, 2*harmonics] Fourier features.
+
+    sin/cos keep 0.9 -> 0.0 continuous (no wrap-around jump).
+    """
+    k = torch.arange(1, harmonics + 1, device=phase.device, dtype=phase.dtype)
+    angle = 2.0 * math.pi * phase[:, None] * k[None]
+    return torch.cat([torch.sin(angle), torch.cos(angle)], dim=1)
 
 
 class ConvNormAct3D(nn.Module):
@@ -461,7 +470,7 @@ class RefTemporalDenoisingUNet3D(nn.Module):
             )
 
         cond = self._condition(t, temporal_context)
-        x = self.input_proj(x_t)      #. going from latent channels to UNet base channels (16 -> 128)
+        x = self.input_proj(x_t)      # latent channels -> UNet base channels
         skips = []
 
         # Down levels 0 .. L-2.
@@ -500,7 +509,6 @@ class RefTemporalDenoisingUNet3D(nn.Module):
             x = self.up_attn[up_idx](x)
 
         return self.output_proj(x)
-
 
 
 # FOR ABLATION STUDY
@@ -733,7 +741,7 @@ class CosineDDIMScheduler:
 
 
 # =============================================================================
-# Complete Mamba + spatial-reference diffusion model
+# Complete temporal-predictor + spatial-reference diffusion model
 # =============================================================================
 class Diffusion_Mamba_SpatialRef(nn.Module):
     def __init__(
@@ -771,11 +779,19 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         latent_use_mean: bool = True,
         freeze_vae: bool = True,
         dvf_downsample_factor: float = 1.0,
-        # CFG -- temporal condition only
+        # Two-axis CFG
         cfg_dropout_temporal: float = 0.30,
         cfg_dropout_vref: float = 0.15,
         cfg_scale_temporal: float = 3.0,
         cfg_scale_vref: float = 1.5,
+        # KL weight for a TRAINABLE posterior temporal predictor
+        temporal_kl_weight: float = 1e-3,
+        # temporal_predictor="phase": number of sin/cos harmonics
+        phase_harmonics: int = 2,
+        # Optional, inference only: camera-surface phase forecaster checkpoint.
+        # When attached, forward(Vref, Sseq=surfaces) predicts the phase itself.
+        phase_forecaster_checkpoint: str | None = None,
+        phase_forecast_steps: Sequence[int] | None = None,
     ):
         super().__init__()
 
@@ -793,12 +809,11 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         self.freeze_vae = bool(freeze_vae)
         self.freeze_cond_net = bool(freeze_cond_net)
         self.dvf_downsample_factor = max(float(dvf_downsample_factor), 1.0)
-        # self.cfg_dropout = float(cfg_dropout)
-        # self.cfg_guidance_scale = float(cfg_guidance_scale)
         self.cfg_dropout_temporal = float(cfg_dropout_temporal)
         self.cfg_dropout_vref = float(cfg_dropout_vref)
         self.cfg_scale_temporal = float(cfg_scale_temporal)
         self.cfg_scale_vref = float(cfg_scale_vref)
+        self.temporal_kl_weight = float(temporal_kl_weight)
 
         self.ref_mode = str(ref_mode).lower()
         if self.ref_mode not in {"learned", "interpolate", "none"}:
@@ -809,22 +824,58 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         if self.prediction_type not in {"noise", "x0_small"}:
             raise ValueError("prediction_type must be 'noise' or 'x0_small'")
 
+        # ------------------------------------------------------------------
+        # Phase mode: condition on the TARGET respiratory phase instead of a
+        # learned temporal token. No temporal network is built; the phase can
+        # come from 4D filenames (training / oracle test) or from any external
+        # forecaster (e.g. the camera-surface phase forecaster) at deployment.
+        # ------------------------------------------------------------------
+        self.temporal_predictor_name = str(temporal_predictor)
+        self.phase_mode = self.temporal_predictor_name == "phase"
+        self.phase_harmonics = int(phase_harmonics)
+        if self.phase_mode:
+            if self.phase_harmonics < 1:
+                raise ValueError("phase_harmonics must be >= 1")
+            self.pre_latent_dim = 2 * self.phase_harmonics
+
+        # Stored OUTSIDE the module tree on purpose: the forecaster never
+        # enters state_dict(), so diffusion checkpoints stay identical with or
+        # without it, and it is never trained by the diffusion optimizer.
+        object.__setattr__(self, "_phase_forecaster", None)
+        self._phase_steps: list[int] | None = None
+
         self.temporal_null = nn.Parameter(torch.zeros(1, self.pre_latent_dim))
 
         # ------------------------------------------------------------------
-        # Frozen or trainable pretrained Mamba temporal predictor.
+        # Frozen or trainable pretrained temporal predictor.
         # ------------------------------------------------------------------
-        self.cond_net = build_temporal_predictor(
-            temporal_predictor,
-            num_frames=self.num_frames,
-            horizon=self.horizon,
-            pre_latent_dim=self.pre_latent_dim,
-            checkpoint=cond_net_checkpoint,      # <- loading now happens correctly IN HERE, onto the raw net
-            freeze=freeze_cond_net,
-            **(temporal_predictor_kwargs or {}),
-        )
-
+        if self.phase_mode:
+            self.cond_net = None
+        else:
+            self.cond_net = build_temporal_predictor(
+                temporal_predictor,
+                num_frames=self.num_frames,
+                horizon=self.horizon,
+                pre_latent_dim=self.pre_latent_dim,
+                checkpoint=cond_net_checkpoint,  # loaded onto the raw net
+                freeze=freeze_cond_net,
+                **(temporal_predictor_kwargs or {}),
+            )
         self.cond_net_checkpoint = cond_net_checkpoint or ""
+
+        # "slices" -> Iseq; "surface" -> Sseq; "phase" -> target phases.
+        if self.phase_mode:
+            self.temporal_input_modality = "phase"
+            self.temporal_time_dim = 2
+        else:
+            self.temporal_input_modality = str(
+                getattr(self.cond_net, "input_modality", "slices")
+            )
+            self.temporal_time_dim = int(getattr(self.cond_net, "time_dim", 2))
+        print(
+            f"[Temporal conditioning] predictor={self.temporal_predictor_name} "
+            f"input={self.temporal_input_modality}"
+        )
 
         # ------------------------------------------------------------------
         # VAE for latent diffusion.
@@ -848,12 +899,6 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         # ------------------------------------------------------------------
         # Strong patient-specific spatial reference path.
         # ------------------------------------------------------------------
-        # self.ref_encoder = SpatialReferencePyramid3D(
-        #     unet_channels=unet_channels,
-        #     base_channels=int(ref_base_channels),
-        #     encoder_depth=int(ref_encoder_depth),
-        #     max_channels=int(ref_max_channels),
-        # )
         if self.ref_mode == "learned":
             self.ref_encoder = SpatialReferencePyramid3D(
                 unet_channels=unet_channels,
@@ -891,9 +936,78 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         print(f"Beta end:   {self.scheduler.betas[-1].item():.8e}")
         self.spatial_transform = SpatialTransformer(self.vol_size)
 
+        if phase_forecaster_checkpoint:
+            self.attach_phase_forecaster(
+                phase_forecaster_checkpoint,
+                steps=phase_forecast_steps,
+            )
+
+    # ------------------------------------------------------------------
+    # Camera-surface phase forecaster (phase mode, inference only)
+    # ------------------------------------------------------------------
+    def attach_phase_forecaster(
+        self,
+        forecaster,
+        steps: Sequence[int] | None = None,
+    ):
+        """Attach a trained phase forecaster (checkpoint path or module).
+
+        steps[i] = which forecaster output step (camera frames ahead, 0-based)
+        is used as the target phase of diffusion horizon step i. Default:
+        the first `horizon` steps. Pick it to match your system latency.
+        """
+        if not self.phase_mode:
+            raise ValueError(
+                "attach_phase_forecaster requires temporal_predictor='phase'."
+            )
+        if isinstance(forecaster, str):
+            from surface_phase_forecaster import load_forecaster
+            forecaster = load_forecaster(forecaster, torch.device("cpu"))
+
+        forecaster.eval()
+        for p in forecaster.parameters():
+            p.requires_grad_(False)
+
+        steps = list(range(self.horizon)) if steps is None else [int(v) for v in steps]
+        if len(steps) != self.horizon:
+            raise ValueError(
+                f"phase_forecast_steps needs {self.horizon} entries "
+                f"(one per diffusion horizon step), got {steps}"
+            )
+        object.__setattr__(self, "_phase_forecaster", forecaster)
+        self._phase_steps = steps
+        print(f"[Phase forecaster] attached, forecaster steps used: {steps}")
+        return self
+
+    @property
+    def has_phase_forecaster(self) -> bool:
+        return self._phase_forecaster is not None
+
+    @torch.no_grad()
+    def _forecast_phase(self, Sseq: torch.Tensor | None) -> torch.Tensor:
+        if self._phase_forecaster is None:
+            raise ValueError(
+                "temporal_predictor='phase' needs phase=... (e.g. from the 4D "
+                "filenames), or an attached phase forecaster plus Sseq=..."
+            )
+        if Sseq is None:
+            raise ValueError(
+                "A phase forecaster is attached: pass the past camera surfaces "
+                "as Sseq=... (or pass phase=... directly)."
+            )
+        fc = self._phase_forecaster.to(self.temporal_null.device)
+        fc.eval()
+        pred = fc.predict_phase(Sseq.to(self.temporal_null.device))  # [B, H_fc]
+        if max(self._phase_steps) >= pred.shape[1]:
+            raise ValueError(
+                f"phase_forecast_steps {self._phase_steps} exceed the "
+                f"forecaster horizon ({pred.shape[1]} steps)."
+            )
+        return pred[:, self._phase_steps]
+
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze_cond_net:
+        if self.freeze_cond_net and self.cond_net is not None:
             self.cond_net.eval()
         if self.freeze_vae and self.vae is not None:
             self.vae.eval()
@@ -902,48 +1016,111 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
     # ------------------------------------------------------------------
     # Temporal conditioning
     # ------------------------------------------------------------------
-    # def _run_mamba(self, Iseq: torch.Tensor) -> list[torch.Tensor]:
-    #     if Iseq.dim() != 5:
-    #         raise ValueError(
-    #             f"Iseq must be [B,2,T,H,W], got {tuple(Iseq.shape)}"
-    #         )
-    #     past = Iseq[:, :, : self.num_frames].contiguous()
-    #     first = next(self.cond_net.parameters())
-    #     past = past.to(
-    #         device=first.device,
-    #         dtype=first.dtype,
-    #         non_blocking=True,
-    #     )
+    @property
+    def uses_surface_input(self) -> bool:
+        return self.temporal_input_modality == "surface"
 
-    #     ctx = torch.no_grad() if self.freeze_cond_net else torch.enable_grad()
-    #     with ctx:
-    #         tokens = self.cond_net(past)
+    @property
+    def uses_phase_input(self) -> bool:
+        return self.phase_mode
 
-    #     if tokens.ndim != 3 or tokens.shape[1] != self.horizon:
-    #         raise RuntimeError(
-    #             f"Mamba must return [B,{self.horizon},D], "
-    #             f"got {tuple(tokens.shape)}"
-    #         )
-    #     return [tokens[:, i, :] for i in range(self.horizon)]
+    def _phase_features(self, phase) -> list[torch.Tensor]:
+        """phase: list[horizon] of [B], or tensor [B] / [B,horizon], in [0,1)."""
+        if phase is None:
+            raise ValueError(
+                "temporal_predictor='phase' requires phase=... (target "
+                "respiratory phase per horizon step, in [0,1))."
+            )
+        if isinstance(phase, (list, tuple)):
+            phase = torch.stack([torch.as_tensor(p) for p in phase], dim=1)
+        phase = torch.as_tensor(phase)
+        if phase.dim() == 1:
+            phase = phase[:, None]
+        if phase.dim() != 2 or phase.shape[1] != self.horizon:
+            raise ValueError(
+                f"phase must be [B,{self.horizon}] (or a list of {self.horizon} "
+                f"[B] tensors), got {tuple(phase.shape)}"
+            )
+        phase = phase.to(
+            device=self.temporal_null.device,
+            dtype=self.temporal_null.dtype,
+        ) % 1.0
+        return [
+            encode_phase(phase[:, i], self.phase_harmonics)
+            for i in range(self.horizon)
+        ]
 
-    def _run_temporal(self, Iseq: torch.Tensor):
+    def _select_temporal_input(
+        self,
+        Iseq: torch.Tensor | None,
+        Sseq: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return the sequence the selected temporal predictor consumes."""
+        if self.uses_surface_input:
+            if Sseq is None:
+                raise ValueError(
+                    f"temporal_predictor='{self.temporal_predictor_name}' reads "
+                    "abdominal surfaces: pass Sseq=... to forward / "
+                    "forward_train / forward_inference."
+                )
+            if not torch.is_tensor(Sseq):
+                raise TypeError(
+                    f"Sseq must be a tensor, got {type(Sseq)}"
+                )
+            return Sseq
 
+        if Iseq is None:
+            raise ValueError(
+                f"temporal_predictor='{self.temporal_predictor_name}' reads "
+                "2D slices: Iseq is required."
+            )
         if Iseq.dim() != 5:
             raise ValueError(
                 f"Iseq must be [B,2,T,H,W], got {tuple(Iseq.shape)}"
             )
+        return Iseq
+
+    def _run_temporal(
+        self,
+        Iseq: torch.Tensor | None = None,
+        Sseq: torch.Tensor | None = None,
+        phase=None,
+    ):
+        if self.phase_mode:
+            # Explicit phase wins (training / oracle test); otherwise forecast
+            # it from camera surfaces with the attached forecaster.
+            if phase is None:
+                phase = self._forecast_phase(Sseq)
+            return self._phase_features(phase), {}
+
+        seq = self._select_temporal_input(Iseq, Sseq)
+        time_dim = self.temporal_time_dim
+        if not (0 <= time_dim < seq.dim()):
+            raise ValueError(
+                f"time_dim={time_dim} is invalid for a "
+                f"{self.temporal_input_modality} sequence of shape "
+                f"{tuple(seq.shape)}"
+            )
 
         first = next(self.cond_net.parameters())
-
-        Iseq = Iseq.to(
+        seq = seq.to(
             device=first.device,
-            dtype=first.dtype,
+            dtype=first.dtype if seq.is_floating_point() else seq.dtype,
             non_blocking=True,
         )
 
-        past = Iseq[:, :, :self.num_frames].contiguous()
+        T_avail = seq.shape[time_dim]
+        if T_avail < self.num_frames:
+            raise ValueError(
+                f"{self.temporal_input_modality} sequence has T={T_avail} "
+                f"along dim {time_dim}; expected at least "
+                f"num_frames={self.num_frames}."
+            )
 
-        # Future is only needed by a trainable CondiNet posterior.
+        past = seq.narrow(time_dim, 0, self.num_frames).contiguous()
+
+        # Future is only needed by a trainable posterior predictor
+        # (CondiNet / surface CondiNet that is not frozen).
         needs_future = (
             self.cond_net.training
             and getattr(
@@ -958,18 +1135,17 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         if needs_future:
             expected_T = self.num_frames + self.horizon
 
-            if Iseq.shape[2] < expected_T:
+            if T_avail < expected_T:
                 raise ValueError(
-                    f"Temporal predictor requires future frames during training, "
-                    f"but Iseq contains T={Iseq.shape[2]}; "
-                    f"expected at least {expected_T}."
+                    "Temporal predictor requires future frames during "
+                    f"training, but the {self.temporal_input_modality} "
+                    f"sequence contains T={T_avail}; expected at least "
+                    f"{expected_T}."
                 )
 
-            future = Iseq[
-                :,
-                :,
-                self.num_frames:self.num_frames + self.horizon,
-            ].contiguous()
+            future = seq.narrow(
+                time_dim, self.num_frames, self.horizon
+            ).contiguous()
 
         ctx = (
             torch.no_grad()
@@ -1005,6 +1181,7 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
             tokens[:, i, :]
             for i in range(self.horizon)
         ], aux
+
     # ------------------------------------------------------------------
     # Latent/DVF helpers
     # ------------------------------------------------------------------
@@ -1071,22 +1248,23 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
     def forward_train(
         self,
         Vref: torch.Tensor,
-        Iseq: torch.Tensor,
+        Iseq: torch.Tensor | None,
         dvf_gt_list: list[torch.Tensor],
         return_components: bool = False,
+        Sseq: torch.Tensor | None = None,
+        phase=None,
     ):
         device = Vref.device
         self.scheduler.to(device)
         B = Vref.shape[0]
 
-        temporal_features, temporal_aux = self._run_temporal(Iseq)
+        temporal_features, temporal_aux = self._run_temporal(Iseq, Sseq, phase)
         kl_loss = None
 
         if temporal_aux:
             kl_loss = temporal_aux.get("kl_loss")
         total_loss = Vref.new_zeros(())
         component_losses = []
-
 
         # Reference features depend on the diffusion-state spatial size. Since all
         # horizon targets share geometry, compute them after obtaining the first
@@ -1101,8 +1279,6 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
                 if self.use_latent_diffusion
                 else self._downsample_dvf(x0)
             )
-            # print(x0.shape, "dvf shape")
-            # print(x0_small.shape, "latent shape")
 
             if ref_features is None:
                 ref_features = self._reference_features(
@@ -1139,52 +1315,30 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
 
             model_out = self.unet(x_t, t, temporal_cond, step_ref_features)
 
-            if self.prediction_type == "x0_small":
-                pred_x0_small = model_out
-            else:
-                ab = self.scheduler.alphas_bar[t][:, None, None, None, None]
-
-                pred_x0_small = (
-                    x_t - torch.sqrt(1.0 - ab) * model_out
-                ) / (torch.sqrt(ab) + 1e-8)
-
-            if self.use_latent_diffusion:
-                dvf_pred = self._decode_latent(pred_x0_small)
-            else:
-                dvf_pred = self._upsample_dvf(
-                    pred_x0_small,
-                    x0.shape[2:]
-                )
-
-            if dvf_pred.shape[2:] != x0.shape[2:]:
-                dvf_pred = F.interpolate(
-                    dvf_pred,
-                    size=x0.shape[2:],
-                    mode="trilinear",
-                    align_corners=False,
-                )
-
-            loss_dvf = self.dvf_epe_loss(dvf_pred, x0)
-
             target = noise if self.prediction_type == "noise" else x0_small
             loss_diff = F.mse_loss(model_out, target)
 
-            step_loss = loss_diff #+ 0.5 * loss_dvf
+            # Decoded-DVF EPE is currently disabled; re-enable by adding
+            # e.g. 0.5 * self.dvf_epe_loss(decoded, x0) to step_loss.
+            step_loss = loss_diff
 
             total_loss = total_loss + step_loss
             component_losses.append(step_loss.detach())
 
         total_loss = total_loss / float(self.horizon)
         if kl_loss is not None and not self.freeze_cond_net:
-            total_loss = total_loss + 1e-3 * kl_loss
+            total_loss = total_loss + self.temporal_kl_weight * kl_loss
 
         if not return_components:
             return total_loss
 
-        return {
+        out = {
             "loss_diffusion": total_loss,
             "per_horizon_loss": torch.stack(component_losses),
         }
+        if kl_loss is not None:
+            out["temporal_kl"] = kl_loss.detach()
+        return out
 
     # ------------------------------------------------------------------
     # Inference + CFG
@@ -1193,19 +1347,19 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
     def forward_inference(
         self,
         Vref: torch.Tensor,
-        Iseq: torch.Tensor,
-        # cfg_scale: float | None = None,
+        Iseq: torch.Tensor | None,
         cfg_scale_temporal: float | None = None,
         cfg_scale_vref: float | None = None,
+        Sseq: torch.Tensor | None = None,
+        phase=None,
     ):
         device = Vref.device
         self.scheduler.to(device)
         B = Vref.shape[0]
-        # w = self.cfg_guidance_scale if cfg_scale is None else float(cfg_scale)
         w_t = self.cfg_scale_temporal if cfg_scale_temporal is None else float(cfg_scale_temporal)
         w_v = self.cfg_scale_vref if cfg_scale_vref is None else float(cfg_scale_vref)
 
-        temporal_features, temporal_aux = self._run_temporal(Iseq)
+        temporal_features, _ = self._run_temporal(Iseq, Sseq, phase)
         spatial_shape = tuple(Vref.shape[2:])
 
         if self.use_latent_diffusion:
@@ -1219,7 +1373,6 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         else:
             low_shape = self._downsample_shape(spatial_shape)
 
-        # Reference conditioning is deterministic and never dropped by CFG.
         ref_features = self._reference_features(Vref, diffusion_shape=low_shape)
         ref_null = self.ref_encoder.null_like(ref_features)
         temporal_null = self.temporal_null.expand(B, -1)
@@ -1228,19 +1381,9 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
         generated_volumes = []
 
         for step in range(self.horizon):
-            temporal_cond = temporal_features[step]
-            # temporal_uncond = torch.zeros_like(temporal_cond)
+            temporal_cond = temporal_features[step].to(temporal_null.dtype)
 
             def model_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                # If w==1, the guided result is exactly the conditional branch.
-                # We still support batched CFG for any guidance scale.
-                # if w == 1.0:
-                #     return self.unet(
-                #         x_t,
-                #         t,
-                #         temporal_cond,
-                #         ref_features,
-                #     )
                 if w_t == 1.0 and w_v == 1.0:
                     return self.unet(x_t, t, temporal_cond, ref_features)
                 x3 = torch.cat([x_t, x_t, x_t], dim=0)
@@ -1259,24 +1402,6 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
                     + w_v * (pred_vref_only - pred_none)
                     + w_t * (pred_full - pred_vref_only)
                 )
-            
-                # x_both = torch.cat([x_t, x_t], dim=0)
-                # t_both = torch.cat([t, t], dim=0)
-                # temporal_both = torch.cat(
-                #     [temporal_cond, temporal_uncond],
-                #     dim=0,
-                # )
-                # # Crucial: Vref is present in BOTH CFG branches.
-                # ref_both = [torch.cat([r, r], dim=0) for r in ref_features]
-
-                # pred_both = self.unet(
-                #     x_both,
-                #     t_both,
-                #     temporal_both,
-                #     ref_both,
-                # )
-                # pred_cond, pred_uncond = pred_both.chunk(2, dim=0)
-                # return pred_uncond + w * (pred_cond - pred_uncond)
 
             low_pred = self.scheduler.ddim_sample(
                 model_fn=model_fn,
@@ -1314,11 +1439,13 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
     def forward(
         self,
         Vref: torch.Tensor,
-        Iseq: torch.Tensor,
+        Iseq: torch.Tensor | None = None,
         dvf_gt_list: list[torch.Tensor] | None = None,
         return_components: bool = False,
         cfg_scale_temporal: float | None = None,
         cfg_scale_vref: float | None = None,
+        Sseq: torch.Tensor | None = None,
+        phase=None,
     ):
         if dvf_gt_list is not None:
             return self.forward_train(
@@ -1326,8 +1453,17 @@ class Diffusion_Mamba_SpatialRef(nn.Module):
                 Iseq,
                 dvf_gt_list,
                 return_components=return_components,
+                Sseq=Sseq,
+                phase=phase,
             )
-        return self.forward_inference(Vref, Iseq, cfg_scale_temporal=cfg_scale_temporal, cfg_scale_vref=cfg_scale_vref)
+        return self.forward_inference(
+            Vref,
+            Iseq,
+            cfg_scale_temporal=cfg_scale_temporal,
+            cfg_scale_vref=cfg_scale_vref,
+            Sseq=Sseq,
+            phase=phase,
+        )
 
 
 # Drop-in alias for existing training code style.
